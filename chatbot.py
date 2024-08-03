@@ -1,98 +1,168 @@
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
-import logging
+   import transformers
+   import torch
+   import pandas as pd
+   from transformers import BitsAndBytesConfig
+   from collections import Counter
+   import os
 
+   # Streamlit page config
+   st.set_page_config(page_title="LLaMA Support Ticket Analyzer", page_icon="🎫", layout="wide")
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+   @st.cache_resource
+   def initialize_pipeline():
+       model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+       quantization_config = BitsAndBytesConfig(load_in_4bit=True)
 
-# Load pre-trained model and tokenizer
-model_name = "meta-llama/Meta-Llama-Guard-2-8B"  # Using a publicly available model
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
+       # Get the Hugging Face token from the environment variable
+       hf_token = os.environ.get("HUGGINGFACE_TOKEN")
+       if not hf_token:
+           st.error("Hugging Face token not found. Please set the HUGGINGFACE_TOKEN environment variable.")
+           st.stop()
 
-# Convert model to bfloat16 precision
-model = model.half()
+       pipeline = transformers.pipeline(
+           "text-generation",
+           model=model_id,
+           model_kwargs={
+               "torch_dtype": torch.bfloat16,
+               "low_cpu_mem_usage": True,
+               "quantization_config": quantization_config
+           },
+           token=hf_token
+       )
+       return pipeline
 
-# Move model to CPU or GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+   @st.cache_data
+   def load_dataset(dataset_path):
+       try:
+           dataset = pd.read_csv(dataset_path, low_memory=False)
+           st.success(f"Dataset loaded successfully with {len(dataset)} rows")
+           return dataset
+       except Exception as e:
+           st.error(f"Error loading dataset: {e}")
+           return pd.DataFrame()  # Create an empty DataFrame if loading fails
 
-# Implement the chatbot
-tokenizer.pad_token = tokenizer.eos_token
-model.config.pad_token_id = model.config.eos_token_id
+   def search_dataset(query, dataset):
+       query_words = query.lower().split()
+       results = dataset[
+           dataset['subject'].str.lower().apply(lambda x: any(word in str(x) for word in query_words)) |
+           dataset['description'].str.lower().apply(lambda x: any(word in str(x) for word in query_words))
+       ]
+       return results.to_dict(orient='records')
 
-def chatbot_response(user_input):
-    logger.info(f"Received user input: {user_input}")  # Log the user input
-    
-    if not user_input.strip():
-        logger.warning("Empty input received")
-        return "Please provide a valid input."
+   def analyze_common_issues(dataset, top_n=5):
+       subject_counts = Counter(dataset['subject'])
+       top_subjects = subject_counts.most_common(top_n)
+       total = len(dataset)
+       result = [(subject, count, (count/total)*100) for subject, count in top_subjects]
+       return result
 
-    # Encode the input and create attention mask
-    encoded_input = tokenizer.encode_plus(
-        user_input,
-        return_tensors="pt",
-        padding='max_length',
-        truncation=True,
-        max_length=512
-    )
-    inputs = encoded_input['input_ids'].to(device)
-    attention_mask = encoded_input['attention_mask'].to(device)
+   def generate_response(pipeline, prompt):
+       outputs = pipeline(
+           prompt,
+           max_new_tokens=512,
+           do_sample=True,
+           temperature=0.7,
+           top_p=0.9,
+       )
+       response = outputs[0]["generated_text"].strip()
+       return response.split("Assistant:")[-1].strip()
 
-    logger.info(f"Encoded input shape: {inputs.shape}")  
+   def summarize_dataset(dataset):
+       total_tickets = len(dataset)
+       unique_subjects = dataset['subject'].nunique()
+       top_issues = analyze_common_issues(dataset)
+       
+       summary = f"Dataset Summary:\n"
+       summary += f"Total tickets: {total_tickets}\n"
+       summary += f"Unique subjects: {unique_subjects}\n\n"
+       summary += "Top 5 issues:\n"
+       for i, (issue, count, percentage) in enumerate(top_issues, 1):
+           summary += f"{i}. {issue}: {count} ({percentage:.1f}%)\n"
+       
+       return summary
 
-    try:
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs,
-                attention_mask=attention_mask,
-                max_length=inputs.shape[1] + 50,
-                num_return_sequences=1,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id
-            )
-        output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        logger.info(f"Generated response: {output_text}")  # Log the generated response
-        return output_text
-    except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
-        return f"Error generating response: {str(e)}"
+   def chatbot(user_input, pipeline, dataset):
+       instructions = """
+       You are an AI assistant for analyzing support ticket data. Your responses should be:
+       Accurate: Only provide information from the dataset. Never invent data.
+       Concise: Give brief, focused answers addressing the user's query.
+       Data-driven: For common issues, summarize top ticket categories with counts and percentages.
+       Honest: Admit when you lack relevant information.
+       Consistent: Maintain coherence across responses.
+       Direct: Avoid unnecessary preambles. Answer queries promptly and precisely.
+       Base all responses on the support ticket dataset. If unsure, state your uncertainty clearly.
+       """
 
-# Create a Streamlit app
-def main():
-    st.title("Chatbot")
-    
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+       if "summarize" in user_input.lower() or "summarise" in user_input.lower():
+           context = summarize_dataset(dataset)
+       else:
+           search_results = search_dataset(user_input, dataset)
+           if search_results:
+               context = "\n".join([f"Subject: {result['subject']}\nDescription: {result['description']}" for result in search_results[:3]])
+           else:
+               context = "No relevant information found in the dataset."
 
-    # Display chat messages from history on app rerun
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+       prompt = f"""Instructions: {instructions}
 
-    # React to user input
-    if prompt := st.chat_input("What is your message?"):
-        # Display user message in chat message container
-        st.chat_message("user").markdown(prompt)
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
+   User Query: {user_input}
 
-        logger.info("Sending user input to chatbot_response function")  # Log before calling the function
-        response = chatbot_response(prompt)
-        logger.info("Received response from chatbot_response function")  # Log after receiving the response
-        
-        # Display assistant response in chat message container
-        with st.chat_message("assistant"):
-            st.markdown(response)
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
+   Relevant Context from Support Tickets:
+   {context}"""
 
-if __name__ == "__main__":
-    main()
+       response = generate_response(pipeline, prompt)
+       return response
 
-# To run: streamlit run chatbot.py
+   def main():
+       st.title("🎫 LLaMA Support Ticket Analyzer")
+       st.write("Ask questions about support tickets and get AI-generated responses based on the dataset.")
+
+       # Initialize the pipeline
+       pipeline = initialize_pipeline()
+
+       # Load the dataset
+       dataset_path = "support_tickets.csv"  # Update with your dataset path
+       dataset = load_dataset(dataset_path)
+
+       # Sidebar
+       st.sidebar.header("📊 Dataset Info")
+       st.sidebar.write(f"Total tickets: {len(dataset)}")
+       st.sidebar.write(f"Unique subjects: {dataset['subject'].nunique()}")
+
+       st.sidebar.header("🔍 Example Queries")
+       example_queries = [
+           "Summarize the dataset",
+           "What are the most common issues?",
+           "Tell me about network connectivity problems",
+           "How many tickets are related to software updates?",
+       ]
+       for query in example_queries:
+           if st.sidebar.button(query):
+               st.session_state.messages.append({"role": "user", "content": query})
+               with st.chat_message("user"):
+                   st.markdown(query)
+               with st.chat_message("assistant"):
+                   response = chatbot(query, pipeline, dataset)
+                   st.markdown(response)
+               st.session_state.messages.append({"role": "assistant", "content": response})
+
+       # Chat interface
+       if "messages" not in st.session_state:
+           st.session_state.messages = []
+
+       for message in st.session_state.messages:
+           with st.chat_message(message["role"]):
+               st.markdown(message["content"])
+
+       if prompt := st.chat_input("What would you like to know about the support tickets?"):
+           st.session_state.messages.append({"role": "user", "content": prompt})
+           with st.chat_message("user"):
+               st.markdown(prompt)
+
+           with st.chat_message("assistant"):
+               response = chatbot(prompt, pipeline, dataset)
+               st.markdown(response)
+           st.session_state.messages.append({"role": "assistant", "content": response})
+
+   if __name__ == "__main__":
+       main()
