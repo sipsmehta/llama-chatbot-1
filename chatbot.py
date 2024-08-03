@@ -2,7 +2,7 @@ import streamlit as st
 import transformers
 import torch
 import pandas as pd
-from transformers import BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from collections import Counter
 import os
 
@@ -12,7 +12,6 @@ st.set_page_config(page_title="LLaMA Support Ticket Analyzer", page_icon="🎫",
 @st.cache_resource
 def initialize_pipeline():
     model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
-    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
 
     # Get the Hugging Face token from the environment variable
     hf_token = os.environ.get("HUGGINGFACE_TOKEN")
@@ -20,15 +19,26 @@ def initialize_pipeline():
         st.error("Hugging Face token not found. Please set the HUGGINGFACE_TOKEN environment variable.")
         st.stop()
 
+    # Check if GPU is available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    st.info(f"Using device: {device}")
+
+    # Load tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        token=hf_token,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        low_cpu_mem_usage=True,
+        device_map="auto"
+    )
+
+    # Create a text generation pipeline
     pipeline = transformers.pipeline(
         "text-generation",
-        model=model_id,
-        model_kwargs={
-            "torch_dtype": torch.bfloat16,
-            "low_cpu_mem_usage": True,
-            "quantization_config": quantization_config
-        },
-        token=hf_token
+        model=model,
+        tokenizer=tokenizer,
+        device=device
     )
     return pipeline
 
@@ -118,7 +128,8 @@ def main():
     st.write("Ask questions about support tickets and get AI-generated responses based on the dataset.")
 
     # Initialize the pipeline
-    pipeline = initialize_pipeline()
+    with st.spinner("Initializing the AI model... This may take a few minutes."):
+        pipeline = initialize_pipeline()
 
     # Load the dataset
     dataset_path = "support_tickets.csv"  # Update with your dataset path
